@@ -1,0 +1,5 @@
+{
+  "type": "shared-browser",
+  "id": "@kbn/shared-ux-page-kibana-template-mocks",
+  "owner": "@elastic/appex-sharedux"
+}

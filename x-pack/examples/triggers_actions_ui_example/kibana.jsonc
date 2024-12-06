@@ -1,0 +1,24 @@
+{
+  "type": "plugin",
+  "id": "@kbn/triggers-actions-ui-example-plugin",
+  "owner": "@elastic/response-ops",
+  "plugin": {
+    "id": "triggersActionsUiExample",
+    "server": true,
+    "browser": true,
+    "requiredPlugins": [
+      "triggersActionsUi",
+      "data",
+      "alerting",
+      "developerExamples",
+      "kibanaReact",
+      "cases",
+      "actions",
+      "charts",
+      "dataViews",
+      "dataViewEditor",
+      "unifiedSearch"
+    ],
+    "optionalPlugins": ["spaces"]
+  }
+}

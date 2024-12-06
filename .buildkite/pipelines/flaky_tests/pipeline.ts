@@ -1,0 +1,244 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the Server Side Public License, v 1; you may not use this file except
+ * in compliance with, at your election, the Elastic License 2.0 or the Server
+ * Side Public License, v 1.
+ */
+
+import { groups } from './groups.json';
+import { BuildkiteStep } from '#pipeline-utils';
+
+const configJson = process.env.KIBANA_FLAKY_TEST_RUNNER_CONFIG;
+if (!configJson) {
+  console.error('+++ Triggering directly is not supported anymore');
+  console.error(
+    `Please use the "Trigger Flaky Test Runner" UI to run the Flaky Test Runner. You can find the UI at the URL below:`
+  );
+  console.error('\n    https://ci-stats.kibana.dev/trigger_flaky_test_runner\n');
+  process.exit(1);
+}
+
+const concurrency = process.env.KIBANA_FLAKY_TEST_CONCURRENCY
+  ? parseInt(process.env.KIBANA_FLAKY_TEST_CONCURRENCY, 10)
+  : 25;
+
+if (Number.isNaN(concurrency)) {
+  throw new Error(
+    `invalid KIBANA_FLAKY_TEST_CONCURRENCY: ${process.env.KIBANA_FLAKY_TEST_CONCURRENCY}`
+  );
+}
+
+const BASE_JOBS = 1;
+const MAX_JOBS = 500;
+
+// TODO: remove this after https://github.com/elastic/kibana-operations/issues/15 is finalized
+/** This function bridges the agent targeting between gobld and kibana-buildkite agent targeting */
+const getAgentRule = (queueName: string = 'n2-4-spot') => {
+  if (
+    process.env.BUILDKITE_AGENT_META_DATA_QUEUE === 'gobld' ||
+    process.env.BUILDKITE_AGENT_META_DATA_PROVIDER === 'k8s'
+  ) {
+    const [kind, cores, addition] = queueName.split('-');
+    const additionalProps =
+      {
+        spot: { preemptible: true },
+        virt: { localSsdInterface: 'nvme', enableNestedVirtualization: true, localSsds: 1 },
+      }[addition] || {};
+
+    return {
+      provider: 'gcp',
+      image: 'family/kibana-ubuntu-2004',
+      imageProject: 'elastic-images-prod',
+      machineType: `${kind}-standard-${cores}`,
+      ...additionalProps,
+    };
+  } else {
+    return {
+      queue: queueName,
+    };
+  }
+};
+
+function getTestSuitesFromJson(json: string) {
+  const fail = (errorMsg: string) => {
+    console.error('+++ Invalid test config provided');
+    console.error(`${errorMsg}: ${json}`);
+    process.exit(1);
+  };
+
+  let parsed;
+  try {
+    parsed = JSON.parse(json);
+  } catch (error) {
+    fail(`JSON test config did not parse correctly`);
+  }
+
+  if (!Array.isArray(parsed)) {
+    fail(`JSON test config must be an array`);
+  }
+
+  const testSuites: Array<
+    | { type: 'group'; key: string; count: number }
+    | { type: 'ftrConfig'; ftrConfig: string; count: number }
+  > = [];
+  for (const item of parsed) {
+    if (typeof item !== 'object' || item === null) {
+      fail(`testSuites must be objects`);
+    }
+
+    const count = item.count;
+    if (typeof count !== 'number') {
+      fail(`testSuite.count must be a number`);
+    }
+
+    const type = item.type;
+    if (type !== 'ftrConfig' && type !== 'group') {
+      fail(`testSuite.type must be either "ftrConfig" or "group"`);
+    }
+
+    if (item.type === 'ftrConfig') {
+      const ftrConfig = item.ftrConfig;
+      if (typeof ftrConfig !== 'string') {
+        fail(`testSuite.ftrConfig must be a string`);
+      }
+
+      testSuites.push({
+        type: 'ftrConfig',
+        ftrConfig,
+        count,
+      });
+      continue;
+    }
+
+    const key = item.key;
+    if (typeof key !== 'string') {
+      fail(`testSuite.key must be a string`);
+    }
+    testSuites.push({
+      type: 'group',
+      key,
+      count,
+    });
+  }
+
+  return testSuites;
+}
+
+const testSuites = getTestSuitesFromJson(configJson);
+
+const totalJobs = testSuites.reduce((acc, t) => acc + t.count, BASE_JOBS);
+
+if (totalJobs > MAX_JOBS) {
+  console.error('+++ Too many tests');
+  console.error(
+    `Buildkite builds can only contain ${MAX_JOBS} jobs in total. Found ${totalJobs} based on this config. Make sure your test runs are less than ${
+      MAX_JOBS - BASE_JOBS
+    }`
+  );
+  process.exit(1);
+}
+
+const steps: BuildkiteStep[] = [];
+const pipeline = {
+  env: {
+    IGNORE_SHIP_CI_STATS_ERROR: 'true',
+  },
+  steps,
+};
+
+steps.push({
+  command: '.buildkite/scripts/steps/build_kibana.sh',
+  label: 'Build Kibana Distribution and Plugins',
+  agents: getAgentRule('c2-8'),
+  key: 'build',
+  if: "build.env('KIBANA_BUILD_ID') == null || build.env('KIBANA_BUILD_ID') == ''",
+});
+
+let suiteIndex = 0;
+for (const testSuite of testSuites) {
+  if (testSuite.count <= 0) {
+    continue;
+  }
+
+  if (testSuite.type === 'ftrConfig') {
+    steps.push({
+      command: `.buildkite/scripts/steps/test/ftr_configs.sh`,
+      env: {
+        FTR_CONFIG: testSuite.ftrConfig,
+      },
+      key: `ftr-suite-${suiteIndex++}`,
+      label: `${testSuite.ftrConfig}`,
+      parallelism: testSuite.count,
+      concurrency,
+      concurrency_group: process.env.UUID,
+      concurrency_method: 'eager',
+      agents: getAgentRule('n2-4-spot'),
+      depends_on: 'build',
+      timeout_in_minutes: 150,
+      cancel_on_build_failing: true,
+      retry: {
+        automatic: [{ exit_status: '-1', limit: 3 }],
+      },
+    });
+    continue;
+  }
+
+  const [category, suiteName] = testSuite.key.split('/');
+  switch (category) {
+    case 'cypress':
+      const group = groups.find((g) => g.key === testSuite.key);
+      if (!group) {
+        throw new Error(
+          `Group configuration was not found in groups.json for the following cypress suite: {${suiteName}}.`
+        );
+      }
+      const agentQueue = suiteName.includes('defend_workflows') ? 'n2-4-virt' : 'n2-4-spot';
+      steps.push({
+        command: `.buildkite/scripts/steps/functional/${suiteName}.sh`,
+        label: group.name,
+        agents: getAgentRule(agentQueue),
+        key: `cypress-suite-${suiteIndex++}`,
+        depends_on: 'build',
+        timeout_in_minutes: 150,
+        parallelism: testSuite.count,
+        concurrency,
+        concurrency_group: process.env.UUID,
+        concurrency_method: 'eager',
+        cancel_on_build_failing: true,
+        retry: {
+          automatic: [{ exit_status: '-1', limit: 3 }],
+        },
+        env: {
+          // disable split of test cases between parallel jobs when running them in flaky test runner
+          // by setting chunks vars to value 1, which means all test will run in one job
+          CLI_NUMBER: 1,
+          CLI_COUNT: 1,
+          // The security solution cypress tests don't recognize CLI_NUMBER and CLI_COUNT, they use `BUILDKITE_PARALLEL_JOB_COUNT` and `BUILDKITE_PARALLEL_JOB`, which cannot be overridden here.
+          // Use `RUN_ALL_TESTS` to make Security Solution Cypress tests run all tests instead of a subset.
+          RUN_ALL_TESTS: 'true',
+        },
+      });
+      break;
+    default:
+      throw new Error(`unknown test suite: ${testSuite.key}`);
+  }
+}
+
+pipeline.steps.push({
+  wait: '~',
+  continue_on_failure: true,
+});
+
+pipeline.steps.push({
+  command: 'ts-node .buildkite/pipelines/flaky_tests/post_stats_on_pr.ts',
+  label: 'Post results on Github pull request',
+  agents: getAgentRule('n2-4-spot'),
+  timeout_in_minutes: 15,
+  retry: {
+    automatic: [{ exit_status: '-1', limit: 3 }],
+  },
+  soft_fail: true,
+});
+
+console.log(JSON.stringify(pipeline, null, 2));

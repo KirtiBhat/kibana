@@ -1,0 +1,5 @@
+{
+  "type": "shared-browser",
+  "id": "@kbn/shared-ux-card-no-data-mocks",
+  "owner": "@elastic/appex-sharedux"
+}

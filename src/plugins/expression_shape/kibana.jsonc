@@ -1,0 +1,19 @@
+{
+  "type": "plugin",
+  "id": "@kbn/expression-shape-plugin",
+  "owner": "@elastic/kibana-presentation",
+  "description": "Adds 'shape' function and renderer to expressions",
+  "plugin": {
+    "id": "expressionShape",
+    "server": true,
+    "browser": true,
+    "requiredPlugins": [
+      "expressions",
+      "presentationUtil"
+    ],
+    "requiredBundles": [],
+    "extraPublicDirs": [
+      "common"
+    ]
+  }
+}
